@@ -121,6 +121,37 @@ export function registerMistralVibeAcpExtensions(context: AcpAdapterV2ExtensionC
   );
 }
 
+const CODEBUDDY_STEER_METHOD = "session/steer";
+const isCodeBuddySteered = Schema.is(Schema.Struct({ steered: Schema.Literal(true) }));
+
+/**
+ * CodeBuddy buffers a `session/steer` and injects it at the next model request,
+ * so accepting the request is delivery. No injection id is reported, hence no
+ * `injectedSteerId` is needed.
+ */
+const codebuddySteering: NonNullable<AcpAdapterV2Flavor["steering"]> = {
+  send: (runtime, sessionId, text, images) =>
+    runtime
+      .request(CODEBUDDY_STEER_METHOD, {
+        sessionId,
+        contentBlocks: [{ type: "text", text }, ...images],
+      })
+      .pipe(
+        Effect.flatMap((result) =>
+          isCodeBuddySteered(result)
+            ? Effect.undefined
+            : Effect.fail(
+                new EffectAcpErrors.AcpRequestError({
+                  code: -32603,
+                  errorMessage: "CodeBuddy did not queue the steering message.",
+                  method: CODEBUDDY_STEER_METHOD,
+                  data: result,
+                }),
+              ),
+        ),
+      ),
+};
+
 export function acpRegistryPromptFailure(agentId: string, cause: unknown) {
   return makeProviderFailure({
     cause,
@@ -244,6 +275,11 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
       /^(?:mistral-)?vibe(?:-acp)?(\.exe|\.cmd)?$/i.test(
         options.settings.commandPath.split(/[\\/]/).pop() ?? "",
       ));
+  // CodeBuddy is configured as a local `--acp` command and has no registry id.
+  const isCodeBuddy =
+    registryAgentId === "codebuddy" ||
+    (options.settings.source === "local" &&
+      /^codebuddy(\.exe|\.cmd)?$/i.test(options.settings.commandPath.split(/[\\/]/).pop() ?? ""));
   const runtimeOptions = isClaude
     ? {
         ...options,
@@ -266,12 +302,19 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
   const flavor: AcpAdapterV2Flavor = {
     driver: ACP_REGISTRY_PROVIDER,
     // Cancelling a Copilot prompt also kills the background agents it started.
-    capabilities: isCopilot
-      ? {
-          ...AcpProviderCapabilitiesV2,
-          turns: { ...AcpProviderCapabilitiesV2.turns, supportsSteeringByInterruptRestart: false },
-        }
-      : AcpProviderCapabilitiesV2,
+    // CodeBuddy steers natively through `session/steer`, so it must not interrupt-restart.
+    capabilities:
+      isCodeBuddy || isCopilot
+        ? {
+            ...AcpProviderCapabilitiesV2,
+            turns: {
+              ...AcpProviderCapabilitiesV2.turns,
+              ...(isCodeBuddy ? { supportsActiveSteering: true } : {}),
+              supportsSteeringByInterruptRestart: false,
+            },
+          }
+        : AcpProviderCapabilitiesV2,
+    ...(isCodeBuddy ? { steering: codebuddySteering } : {}),
     customModels: readCustomModelEntries(options.settings.customModels).map((entry) => entry.slug),
     compactViaAdvertisedCommand: true,
     ...(isAntigravityCli ? { wakeOnDetachedRequest: true, replyEndsWithUsageUpdate: true } : {}),
